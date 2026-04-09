@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Image
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
+import cv2
 
 import torch
 import numpy as np
@@ -48,6 +49,7 @@ class LocalizationNode(Node):
         
         # Publisher and Subscriber
         self.pose_pub = self.create_publisher(PoseStamped, '/localized_pose', 10)
+        self.debug_pub = self.create_publisher(Image, '/localization_debug_image', 10)
         self.image_sub = self.create_subscription(
             CompressedImage,
             '/camera/color/image_raw/compressed',
@@ -106,6 +108,47 @@ class LocalizationNode(Node):
         pose_msg.pose.orientation.w = float(localized_pose_array[6])
         
         self.pose_pub.publish(pose_msg)
+
+        # 5. Visual Debug Image
+        try:
+            # Flatten and normalize embedding
+            emb_1d = embedding_np.flatten()
+            emb_min, emb_max = emb_1d.min(), emb_1d.max()
+            emb_norm = np.clip((emb_1d - emb_min) / (emb_max - emb_min + 1e-6) * 255, 0, 255).astype(np.uint8)
+            
+            # Create a 50px tall bar
+            bar_height = 50
+            emb_bar = np.tile(emb_norm, (bar_height, 1))
+            
+            # Resize strip to match image width
+            img_h, img_w = cv_img.shape[:2]
+            emb_bar_resized = cv2.resize(emb_bar, (img_w, bar_height), interpolation=cv2.INTER_NEAREST)
+            
+            # Apply colormap (cv2 expects BGR for colormap usually, but we are producing an RGB heatmap since we will stack it with an RGB image...
+            # Actually, applyColorMap returns BGR, so if we are working in RGB, we'll need to convert it)
+            emb_heatmap_bgr = cv2.applyColorMap(emb_bar_resized, cv2.COLORMAP_JET)
+            emb_heatmap_rgb = cv2.cvtColor(emb_heatmap_bgr, cv2.COLOR_BGR2RGB)
+            
+            # Append heatmap to the bottom of the image
+            debug_img = np.vstack((cv_img, emb_heatmap_rgb))
+            
+            # Overlay text
+            text_lines = [
+                f"KF: {keyframe_id} Score: {score:.3f}",
+                f"Pose: ({localized_pose_array[0]:.2f}, {localized_pose_array[1]:.2f}, {localized_pose_array[2]:.2f})"
+            ]
+            
+            y0, dy = 30, 30
+            for i, line in enumerate(text_lines):
+                y = y0 + i * dy
+                cv2.putText(debug_img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3) # Outline
+                cv2.putText(debug_img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+            debug_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="rgb8")
+            debug_msg.header = img_msg.header
+            self.debug_pub.publish(debug_msg)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish debug image: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
