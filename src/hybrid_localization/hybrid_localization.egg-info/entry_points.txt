@@ -1,0 +1,3 @@
+[console_scripts]
+localization_node = hybrid_localization.localization_node:main
+mapping_node = hybrid_localization.mapping_node:main
