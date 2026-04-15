@@ -11,7 +11,15 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'faiss-cpu==1.7.4',
+        'numpy',
+        'Pillow>=9.1.0',
+        'sentencepiece',
+        'torch',
+        'transformers',
+    ],
     zip_safe=True,
     maintainer='gauravkh',
     maintainer_email='kothamachuharish.g@northeastern.edu',
@@ -26,6 +34,10 @@ setup(
         'console_scripts': [
             'mapping_node = hybrid_localization.mapping_node:main',
             'localization_node = hybrid_localization.localization_node:main',
+            (
+                'compressed_image_republisher = '
+                'hybrid_localization.compressed_image_republisher:main'
+            ),
         ],
     },
 )

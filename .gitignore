@@ -1,0 +1,17 @@
+build/
+install/
+log/
+
+data/*
+!data/README.md
+!data/COLCON_IGNORE
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+*.faiss
+keyframe_poses.npy
+keyframe_ids.npy
+keyframe_stamps.npy

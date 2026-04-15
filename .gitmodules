@@ -1,0 +1,6 @@
+[submodule "src/LIO-SAM"]
+	path = src/LIO-SAM
+	url = https://github.com/TixiaoShan/LIO-SAM.git
+[submodule "third_party/M2DGR"]
+	path = third_party/M2DGR
+	url = https://github.com/SJTU-ViSYS/M2DGR.git
