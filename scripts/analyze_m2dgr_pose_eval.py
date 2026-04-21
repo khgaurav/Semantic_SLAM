@@ -63,13 +63,14 @@ def read_pose_topic(bag_dir: Path, topic: str, nested_pose: bool):
                 f"Bag {bag_dir} is missing required topic: {topic}"
             )
         wanted = [conn for conn in reader.connections if conn.topic == topic]
-        for conn, _timestamp, rawdata in reader.messages(connections=wanted):
+        for conn, bag_timestamp, rawdata in reader.messages(connections=wanted):
             msg = reader.deserialize(rawdata, conn.msgtype)
             t = stamp_to_sec(msg.header.stamp)
             pose = msg.pose.pose if nested_pose else msg.pose
             poses.append(
                 (
                     t,
+                    float(bag_timestamp) * 1e-9,
                     np.array(
                         [
                             float(pose.position.x),
@@ -81,6 +82,28 @@ def read_pose_topic(bag_dir: Path, topic: str, nested_pose: bool):
                 )
             )
     return poses
+
+
+def read_scalar_topic(bag_dir: Path, topic: str):
+    values = []
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    with AnyReader([bag_dir], default_typestore=typestore) as reader:
+        topics = {conn.topic for conn in reader.connections}
+        if topic not in topics:
+            return values
+        wanted = [conn for conn in reader.connections if conn.topic == topic]
+        for conn, timestamp, rawdata in reader.messages(connections=wanted):
+            msg = reader.deserialize(rawdata, conn.msgtype)
+            stamp = getattr(msg, "header", None)
+            if stamp is not None:
+                t = stamp_to_sec(msg.header.stamp)
+            else:
+                t = float(timestamp) * 1e-9
+            data = getattr(msg, "data", None)
+            if data is None:
+                continue
+            values.append((t, data))
+    return values
 
 
 def read_pose_streams(
@@ -95,12 +118,37 @@ def read_pose_streams(
     return localized, odom
 
 
-def align_streams(localized, odom, max_dt: float, map_dir: Path | None):
+def nearest_value(series, target_t: float, max_dt: float):
+    if not series:
+        return None
+    times = [row[0] for row in series]
+    insert_at = bisect_left(times, target_t)
+    candidates = []
+    if insert_at > 0:
+        candidates.append(insert_at - 1)
+    if insert_at < len(series):
+        candidates.append(insert_at)
+    if not candidates:
+        return None
+    best_idx = min(candidates, key=lambda idx: abs(series[idx][0] - target_t))
+    value_t, value = series[best_idx]
+    if value_t is None or abs(value_t - target_t) > max_dt:
+        return None
+    return value
+
+
+def align_streams(localized, odom, max_dt: float, map_dir: Path | None, bag_dir: Path):
     odom_times = [row[0] for row in odom]
     keyframe_poses, keyframe_ids = load_keyframe_lookup(map_dir)
+    matched_keyframe_ids = read_scalar_topic(
+        bag_dir, "/localization/matched_keyframe_id"
+    )
+    matched_keyframe_stamps = read_scalar_topic(
+        bag_dir, "/localization/matched_keyframe_stamp"
+    )
     rows = []
 
-    for loc_t, loc_pos, loc_yaw in localized:
+    for loc_t, loc_record_t, loc_pos, loc_yaw in localized:
         insert_at = bisect_left(odom_times, loc_t)
         candidates = []
         if insert_at > 0:
@@ -110,7 +158,7 @@ def align_streams(localized, odom, max_dt: float, map_dir: Path | None):
         if not candidates:
             continue
         best_idx = min(candidates, key=lambda idx: abs(odom[idx][0] - loc_t))
-        ref_t, ref_pos, ref_yaw = odom[best_idx]
+        ref_t, _ref_record_t, ref_pos, ref_yaw = odom[best_idx]
         dt = loc_t - ref_t
         if abs(dt) > max_dt:
             continue
@@ -122,6 +170,12 @@ def align_streams(localized, odom, max_dt: float, map_dir: Path | None):
             keyframe_id, keyframe_dist = nearest_keyframe_id(
                 loc_pos, keyframe_poses, keyframe_ids
             )
+        matched_keyframe_id = nearest_value(
+            matched_keyframe_ids, loc_record_t, max_dt
+        )
+        matched_keyframe_stamp = nearest_value(
+            matched_keyframe_stamps, loc_record_t, max_dt
+        )
 
         rows.append(
             {
@@ -139,13 +193,31 @@ def align_streams(localized, odom, max_dt: float, map_dir: Path | None):
                 "yaw_err_deg": abs(math.degrees(wrap_angle(loc_yaw - ref_yaw))),
                 "keyframe_id": keyframe_id,
                 "keyframe_dist": keyframe_dist,
+                "matched_keyframe_id": matched_keyframe_id,
+                "matched_keyframe_stamp": matched_keyframe_stamp,
+                "matched_keyframe_relative_t": 0.0,
             }
         )
 
     if rows:
         t0 = rows[0]["t"]
+        stamp0 = next(
+            (
+                row["matched_keyframe_stamp"]
+                for row in rows
+                if row["matched_keyframe_stamp"] not in (None, 0.0)
+            ),
+            None,
+        )
         for row in rows:
             row["relative_t"] = row["t"] - t0
+            if (
+                stamp0 is not None
+                and row["matched_keyframe_stamp"] not in (None, 0.0)
+            ):
+                row["matched_keyframe_relative_t"] = (
+                    row["matched_keyframe_stamp"] - stamp0
+                )
     return rows
 
 
@@ -204,6 +276,64 @@ def compute_summary(localized_count: int, odom_count: int, rows):
 
     high_error_spans = contiguous_spans(rows, threshold=5.0)
     largest_errors = sorted(rows, key=lambda row: row["err_3d"], reverse=True)[:10]
+    temporal_rows = [
+        row
+        for row in rows
+        if row["matched_keyframe_stamp"] not in (None, 0.0)
+    ]
+    temporal_deltas = []
+    temporal_reversals = []
+    for prev, cur in zip(temporal_rows, temporal_rows[1:]):
+        delta_map_t = (
+            cur["matched_keyframe_relative_t"] - prev["matched_keyframe_relative_t"]
+        )
+        delta_query_t = cur["relative_t"] - prev["relative_t"]
+        record = {
+            "relative_t": cur["relative_t"],
+            "query_dt": delta_query_t,
+            "map_dt": delta_map_t,
+            "from_keyframe_id": prev["matched_keyframe_id"],
+            "to_keyframe_id": cur["matched_keyframe_id"],
+        }
+        temporal_deltas.append(record)
+        if delta_map_t < 0.0:
+            temporal_reversals.append(record)
+
+    temporal_consistency = None
+    if len(temporal_rows) >= 2:
+        query_rel = np.array(
+            [row["relative_t"] for row in temporal_rows], dtype=float
+        )
+        map_rel = np.array(
+            [row["matched_keyframe_relative_t"] for row in temporal_rows],
+            dtype=float,
+        )
+        if np.std(query_rel) > 0.0 and np.std(map_rel) > 0.0:
+            corr = float(np.corrcoef(query_rel, map_rel)[0, 1])
+        else:
+            corr = None
+        nondecreasing_fraction = float(
+            np.mean(
+                [
+                    delta["map_dt"] >= 0.0
+                    for delta in temporal_deltas
+                ]
+            )
+        ) if temporal_deltas else None
+        temporal_consistency = {
+            "valid_rows": len(temporal_rows),
+            "query_duration_sec": float(query_rel[-1] - query_rel[0]),
+            "map_time_span_sec": float(map_rel[-1] - map_rel[0]),
+            "pearson_corr_query_vs_map_time": corr,
+            "nondecreasing_step_fraction": nondecreasing_fraction,
+            "reversal_count": len(temporal_reversals),
+            "reversal_fraction": float(len(temporal_reversals) / len(temporal_deltas))
+            if temporal_deltas
+            else None,
+            "largest_reversals": sorted(
+                temporal_reversals, key=lambda row: row["map_dt"]
+            )[:10],
+        }
 
     return {
         "localized_messages": localized_count,
@@ -265,6 +395,7 @@ def compute_summary(localized_count: int, odom_count: int, rows):
             }
             for row in largest_errors
         ],
+        "temporal_consistency": temporal_consistency,
     }
 
 
@@ -309,7 +440,7 @@ def main() -> int:
         args.odom_topic,
         args.reference_bag_dir,
     )
-    rows = align_streams(localized, odom, args.max_dt, args.map_dir)
+    rows = align_streams(localized, odom, args.max_dt, args.map_dir, args.bag_dir)
     if not rows:
         raise RuntimeError(
             "No synchronized pose pairs were found. Try increasing --max-dt."

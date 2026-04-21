@@ -12,6 +12,7 @@ M2DGR_ROS2_ROOT="${M2DGR_ROS2_ROOT:-$REPO_ROOT/data/m2dgr_ros2}"
 HYBRID_MAP_ROOT="${HYBRID_MAP_ROOT:-$REPO_ROOT/data/hybrid_maps}"
 LOCAL_GTSAM_ROOT="${LOCAL_GTSAM_ROOT:-$REPO_ROOT/data/local/gtsam}"
 IMAGE_TOPIC="${IMAGE_TOPIC:-/camera/color/image_raw/compressed}"
+IMAGE_IS_COMPRESSED="${IMAGE_IS_COMPRESSED:-true}"
 ODOM_TOPIC="${ODOM_TOPIC:-/lio_sam/mapping/odometry}"
 POINTS_TOPIC="${POINTS_TOPIC:-/velodyne_points}"
 IMU_TOPIC="${IMU_TOPIC:-/handsfree/imu}"
@@ -39,6 +40,7 @@ Environment overrides:
   WORKSPACE_SETUP    default: $WORKSPACE_SETUP
   M2DGR_ROS2_ROOT    default: $M2DGR_ROS2_ROOT
   HYBRID_MAP_ROOT    default: $HYBRID_MAP_ROOT
+  IMAGE_IS_COMPRESSED default: $IMAGE_IS_COMPRESSED
   LIO_SAM_PARAMS_FILE
 EOF
 }
@@ -225,6 +227,7 @@ start_bg ros2 run hybrid_localization mapping_node --ros-args \
     -p "map_dir:=$MAP_DIR" \
     -p "odom_topic:=$ODOM_TOPIC" \
     -p "image_topic:=$IMAGE_TOPIC" \
+    -p "image_is_compressed:=$IMAGE_IS_COMPRESSED" \
     -p "model_name:=$MODEL_NAME"
 sleep 8
 

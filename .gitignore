@@ -1,6 +1,10 @@
 build/
 install/
 log/
+.codex
+.codex/
+report_aliasing_plots/
+*.zip
 
 data/*
 !data/README.md
