@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage
-from nav_msgs.msg import Odometry
-from cv_bridge import CvBridge
-from rclpy.qos import qos_profile_sensor_data
-import message_filters
-
-import torch
-import numpy as np
-import faiss
+import cv2
 import os
 import signal
+
+import faiss
+import message_filters
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from cv_bridge import CvBridge
+from nav_msgs.msg import Odometry
 from PIL import Image as PilImage
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CompressedImage, Image
+import torch
 from transformers import AutoProcessor, AutoModel
 
 
@@ -28,6 +29,8 @@ class MappingNode(Node):
             'odom_topic', '/lio_sam/mapping/odometry').value
         self.image_topic = self.declare_parameter(
             'image_topic', '/camera/color/image_raw/compressed').value
+        self.image_is_compressed = self.declare_parameter(
+            'image_is_compressed', True).value
         self.model_name = self.declare_parameter(
             'model_name', 'google/siglip-base-patch16-224').value
         self.min_keyframe_dist = self.declare_parameter(
@@ -36,6 +39,12 @@ class MappingNode(Node):
             'min_keyframe_angle', 0.3).value
         self.max_step_dist = self.declare_parameter(
             'max_step_dist', 50.0).value
+        self.save_keyframe_previews = self.declare_parameter(
+            'save_keyframe_previews', True).value
+        self.keyframe_preview_size = max(
+            64,
+            int(self.declare_parameter('keyframe_preview_size', 320).value)
+        )
 
         # Determine the device
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -61,6 +70,7 @@ class MappingNode(Node):
         self.frame_count = 0  # total frames received (before filtering)
 
         self.last_keyframe_pose = None
+        self.preview_dir = os.path.join(self.map_dir, "keyframe_previews")
 
         # Subscribers
         self.odom_sub = message_filters.Subscriber(
@@ -69,9 +79,10 @@ class MappingNode(Node):
             self.odom_topic,
             qos_profile=qos_profile_sensor_data
         )
+        image_msg_type = CompressedImage if self.image_is_compressed else Image
         self.image_sub = message_filters.Subscriber(
             self,
-            CompressedImage,
+            image_msg_type,
             self.image_topic,
             qos_profile=qos_profile_sensor_data
         )
@@ -86,7 +97,9 @@ class MappingNode(Node):
 
         self.get_logger().info(
             f"Mapping pipeline ready. Odom: {self.odom_topic}, "
-            f"image: {self.image_topic}")
+            f"image: {self.image_topic} "
+            f"(compressed={self.image_is_compressed}), "
+            f"save_previews={self.save_keyframe_previews}")
 
         signal.signal(signal.SIGINT, self._handle_shutdown_signal)
         signal.signal(signal.SIGTERM, self._handle_shutdown_signal)
@@ -152,8 +165,12 @@ class MappingNode(Node):
             f"at ({pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f})")
 
         # 1. Image preprocessing
-        cv_img = self.bridge.compressed_imgmsg_to_cv2(
-            img_msg, desired_encoding='rgb8')
+        if self.image_is_compressed:
+            cv_img = self.bridge.compressed_imgmsg_to_cv2(
+                img_msg, desired_encoding='rgb8')
+        else:
+            cv_img = self.bridge.imgmsg_to_cv2(
+                img_msg, desired_encoding='rgb8')
         pil_img = PilImage.fromarray(cv_img)
 
         # 2. Extract Embedding
@@ -172,6 +189,7 @@ class MappingNode(Node):
         self.faiss_index.add(embedding_np)
 
         # 4. Save Pose
+        self._save_keyframe_preview(cv_img, self.keyframe_count)
         self.keyframe_poses.append(pose_array)
         self.keyframe_stamps.append(self._stamp_to_sec(img_msg.header.stamp))
         self.last_keyframe_pose = pose_array
@@ -206,6 +224,28 @@ class MappingNode(Node):
         self.get_logger().info(
             f"Saved map with {self.keyframe_count} keyframes "
             f"to {self.map_dir}")
+
+    def _save_keyframe_preview(self, rgb_img, keyframe_idx):
+        if not self.save_keyframe_previews:
+            return
+        os.makedirs(self.preview_dir, exist_ok=True)
+        preview = self._resize_preview(rgb_img, self.keyframe_preview_size)
+        preview_bgr = cv2.cvtColor(preview, cv2.COLOR_RGB2BGR)
+        preview_path = os.path.join(
+            self.preview_dir, f"{int(keyframe_idx):06d}.jpg"
+        )
+        cv2.imwrite(preview_path, preview_bgr)
+
+    def _resize_preview(self, rgb_img, target_long_edge):
+        h, w = rgb_img.shape[:2]
+        if h <= 0 or w <= 0:
+            return rgb_img
+        scale = float(target_long_edge) / float(max(h, w))
+        if scale >= 1.0:
+            return rgb_img
+        out_w = max(1, int(round(w * scale)))
+        out_h = max(1, int(round(h * scale)))
+        return cv2.resize(rgb_img, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
 
 def main(args=None):
